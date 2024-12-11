@@ -1,0 +1,2385 @@
+import logging
+from copy import copy, deepcopy  # Use copy and deepcopy functions
+from enum import Enum
+import os
+
+import numpy as np
+from pydrake.all import (
+    AbstractValue,
+    AddMultibodyPlantSceneGraph,
+    CameraConfig,
+    Concatenate,
+    DiagramBuilder,
+    InputPortIndex,
+    LeafSystem,
+    MeshcatVisualizer,
+    Parser,
+    PiecewisePolynomial,
+    PiecewisePose,
+    PointCloud,
+    PortSwitch,
+    RandomGenerator,
+    RigidTransform,
+    RollPitchYaw,
+    Rotation,
+    Simulator,
+    StartMeshcat,
+    Transform,
+    UniformlyRandomRotationMatrix,
+)
+
+from pydrake.systems.primitives import ConstantVectorSource
+
+from manipulation import ConfigureParser, FindResource, running_as_notebook
+from manipulation.clutter import GenerateAntipodalGraspCandidate
+from manipulation.meshcat_utils import AddMeshcatTriad, StopButton
+from manipulation.pick import (
+    MakeGripperCommandTrajectory,
+    MakeGripperFrames,
+    MakeGripperPoseTrajectory,
+)
+from manipulation.scenarios import AddIiwaDifferentialIK, ycb
+from manipulation.station import (
+    AddPointClouds,
+    AppendDirectives,
+    LoadScenario,
+    MakeHardwareStation,
+)
+
+num_cameras = 10
+
+# Create SDF for Soft Rectangular Block
+soft_block_sdf_path = "soft_block.sdf"
+soft_block_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="soft_block">
+    <link name="soft_block_link">
+      <inertial>
+        <mass>0.5</mass>
+        <pose>0 0 0.05 0 0 0</pose>
+        <inertia>
+          <ixx>0.02</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.02</iyy>
+          <iyz>0</iyz>
+          <izz>0.02</izz>
+        </inertia>
+      </inertial>
+      <visual name="soft_block_visual">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="soft_block_collision">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+    </link>
+  </model>
+</sdf>
+"""
+
+with open(soft_block_sdf_path, "w") as f:
+    f.write(soft_block_sdf)
+
+# Create SDF for Hard Rectangular Block
+hard_block_sdf_path = "hard_block.sdf"
+hard_block_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="hard_block">
+    <link name="hard_block_link">
+      <inertial>
+        <mass>0.5</mass>
+        <pose>0 0 0.05 0 0 0</pose>
+        <inertia>
+          <ixx>0.02</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.02</iyy>
+          <iyz>0</iyz>
+          <izz>0.02</izz>
+        </inertia>
+      </inertial>
+      <visual name="hard_block_visual">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="hard_block_collision">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+    </link>
+  </model>
+</sdf>
+"""
+
+with open(hard_block_sdf_path, "w") as f:
+    f.write(hard_block_sdf)
+
+# Create SDF for Soft Doll
+soft_doll_sdf_path = "soft_doll.sdf"
+soft_doll_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="soft_doll">
+    <link name="soft_doll_link">
+      <inertial>
+        <!-- Keeping the mass the same as before for simplicity -->
+        <mass>0.1875</mass>
+        <pose>0 0 0.3 0 0 0</pose>
+        <!-- Slightly adjusted inertias for a more complex shape -->
+        <inertia>
+          <ixx>0.02</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.02</iyy>
+          <iyz>0</iyz>
+          <izz>0.02</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Torso (main body) -->
+      <visual name="torso_visual">
+        <pose>0 0 0.15 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.05 0.15</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.5 0.7 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="torso_collision">
+        <pose>0 0 0.15 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.05 0.15</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Head (small box on top) -->
+      <visual name="head_visual">
+        <pose>0 0 0.2375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.05 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.8 0.6 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="head_collision">
+        <pose>0 0 0.2375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.05 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Left Arm -->
+      <visual name="left_arm_visual">
+        <pose>-0.05 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.01 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.8 0.6 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_arm_collision">
+        <pose>-0.05 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.01 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Right Arm -->
+      <visual name="right_arm_visual">
+        <pose>0.05 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.01 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.8 0.6 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_arm_collision">
+        <pose>0.05 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.01 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Left Leg -->
+      <visual name="left_leg_visual">
+        <pose>-0.015 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.07 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_leg_collision">
+        <pose>-0.015 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.07 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Right Leg -->
+      <visual name="right_leg_visual">
+        <pose>0.015 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.07 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 1.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_leg_collision">
+        <pose>0.015 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.07 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
+"""
+
+with open(soft_doll_sdf_path, "w") as f:
+    f.write(soft_doll_sdf)
+
+# Create SDF for Soft Teddy Bear (replacing soft block)
+soft_teddy_bear_sdf_path = "soft_teddy_bear.sdf"
+soft_teddy_bear_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="soft_teddy_bear">
+    <link name="soft_teddy_bear_link">
+      <inertial>
+        <mass>0.2</mass>
+        <pose>0 0 0.3 0 0 0</pose>
+        <inertia>
+          <ixx>0.0025</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.0025</iyy>
+          <iyz>0</iyz>
+          <izz>0.0025</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Torso -->
+      <visual name="torso_visual">
+        <pose>0 0 0.15 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.035 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="torso_collision">
+        <pose>0 0 0.15 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.035 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Head -->
+      <visual name="head_visual">
+        <pose>0 0 0.225 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.05 0.05</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="head_collision">
+        <pose>0 0 0.225 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.05 0.05 0.05</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Ears -->
+      <visual name="left_ear_visual">
+        <pose>-0.02 0 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.02 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_ear_collision">
+        <pose>-0.02 0 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.02 0.02</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="right_ear_visual">
+        <pose>0.02 0 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.02 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_ear_collision">
+        <pose>0.02 0 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.02 0.02</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Arms -->
+      <visual name="left_arm_visual">
+        <pose>-0.03 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.075</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_arm_collision">
+        <pose>-0.03 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.075</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="right_arm_visual">
+        <pose>0.03 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.075</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_arm_collision">
+        <pose>0.03 0 0.175 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.075</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Legs -->
+      <visual name="left_leg_visual">
+        <pose>-0.015 0 0.1 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.045 0.075</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_leg_collision">
+        <pose>-0.015 0 0.1 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.045 0.075</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="right_leg_visual">
+        <pose>0.015 0 0.1 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.045 0.075</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_leg_collision">
+        <pose>0.015 0 0.1 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.045 0.075</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
+"""
+with open(soft_teddy_bear_sdf_path, "w") as f:
+    f.write(soft_teddy_bear_sdf)
+
+# Create SDF for Hard Model Car (replacing hard block)
+hard_model_car_sdf_path = "hard_model_car.sdf"
+hard_model_car_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="hard_model_car">
+    <link name="hard_model_car_link">
+      <inertial>
+        <mass>0.2</mass>
+        <pose>0 0 0.15 0 0 0</pose>
+        <inertia>
+          <ixx>0.00375</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00375</iyy>
+          <iyz>0</iyz>
+          <izz>0.00375</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Main Chassis -->
+      <visual name="chassis_visual">
+        <pose>0 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 0.075 0.05</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="chassis_collision">
+        <pose>0 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 0.075 0.05</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Cabin on top -->
+      <visual name="cabin_visual">
+        <pose>0 0 0.1 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.075 0.05 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="cabin_collision">
+        <pose>0 0 0.1 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.075 0.05 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Front Bumper -->
+      <visual name="front_bumper_visual">
+        <pose>0.085 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.075 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="front_bumper_collision">
+        <pose>0.085 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.075 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Rear Bumper -->
+      <visual name="rear_bumper_visual">
+        <pose>-0.085 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.075 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="rear_bumper_collision">
+        <pose>-0.085 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.075 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Wheels -->
+      <visual name="front_left_wheel_visual">
+        <pose>0.05 0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="front_left_wheel_collision">
+        <pose>0.05 0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="front_right_wheel_visual">
+        <pose>0.05 -0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="front_right_wheel_collision">
+        <pose>0.05 -0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="rear_left_wheel_visual">
+        <pose>-0.05 0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="rear_left_wheel_collision">
+        <pose>-0.05 0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="rear_right_wheel_visual">
+        <pose>-0.05 -0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="rear_right_wheel_collision">
+        <pose>-0.05 -0.025 0.0375 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.025 0.025 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.02</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
+"""
+with open(hard_model_car_sdf_path, "w") as f:
+    f.write(hard_model_car_sdf)
+
+
+# Create SDF for Table (from original code)
+table_sdf_path = "table.sdf"
+table_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="table">
+    <static>true</static>
+    <link name="table_link">
+      <pose>0 0 -0.06 0 0 0</pose>
+      <collision name="table_collision">
+        <geometry>
+          <box>
+            <size>10 10 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+      <visual name="table_visual">
+        <geometry>
+          <box>
+            <size>10 10 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.5 0.5 0.5 1.0</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
+"""
+with open(table_sdf_path, "w") as f:
+    f.write(table_sdf)
+
+# Create SDF for Hard Rectangular Lego Piece
+hard_lego_sdf_path = "hard_lego_piece.sdf"
+hard_lego_sdf = """<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="hard_lego_piece">
+    <link name="hard_lego_piece_link">
+      <inertial>
+        <mass>0.2</mass>
+        <pose>0 0 0.05 0 0 0</pose>
+        <inertia>
+          <ixx>0.02</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.02</iyy>
+          <iyz>0</iyz>
+          <izz>0.02</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Main Body of the Lego Piece -->
+      <visual name="body_visual">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="body_collision">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.1</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- "Studs" on top (using small boxes) -->
+      <!-- We'll place a 2x2 arrangement of small boxes on the top surface -->
+      <!-- Top surface is at z=0.1. We'll place studs slightly above that: z=0.105 -->
+      <!-- Stud positions: (-0.03, -0.015), (-0.03, 0.015), (0.03, -0.015), (0.03, 0.015) -->
+
+      <visual name="stud_1_visual">
+        <pose>-0.03 -0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="stud_1_collision">
+        <pose>-0.03 -0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="stud_2_visual">
+        <pose>-0.03 0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="stud_2_collision">
+        <pose>-0.03 0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="stud_3_visual">
+        <pose>0.03 -0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="stud_3_collision">
+        <pose>0.03 -0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="stud_4_visual">
+        <pose>0.03 0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="stud_4_collision">
+        <pose>0.03 0.015 0.105 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.01</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Additional decorative boxes along the sides (like small ridges or bumps) -->
+      <!-- Side Ridges: two small boxes on each long side to add complexity -->
+      <!-- We'll place them slightly recessed on the sides at z=0.07 -->
+
+      <!-- Left side ridges -->
+      <visual name="left_ridge_1_visual">
+        <pose>0.02 -0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_ridge_1_collision">
+        <pose>0.02 -0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="left_ridge_2_visual">
+        <pose>-0.02 -0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_ridge_2_collision">
+        <pose>-0.02 -0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Right side ridges -->
+      <visual name="right_ridge_1_visual">
+        <pose>0.02 0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_ridge_1_collision">
+        <pose>0.02 0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="right_ridge_2_visual">
+        <pose>-0.02 0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1.0 1.0 0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_ridge_2_collision">
+        <pose>-0.02 0.025 0.07 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.02 0.005 0.02</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <drake:hydroelastic_modulus>1.0e9</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
+"""
+
+with open(hard_lego_sdf_path, "w") as f:
+    f.write(hard_lego_sdf)
+
+#Create a soft dog toy
+soft_dog_sdf_path="soft_dog.sdf"
+soft_dog_sdf="""<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="soft_dog">
+    <link name="soft_dog_link">
+      <inertial>
+        <mass>0.1</mass>
+        <!-- Center of mass approximately at the center of the body -->
+        <pose>0 0 0.1 0 0 0</pose>
+        <inertia>
+          <!-- Approximate symmetrical inertia for a small plush toy -->
+          <ixx>0.000625</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.000625</iyy>
+          <iyz>0</iyz>
+          <izz>0.000625</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Body: a rectangular box (torso) -->
+      <visual name="body_visual">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 0.05 0.05</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="body_collision">
+        <pose>0 0 0.05 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 0.05 0.05</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:mesh_resolution_hint>0.01</drake:mesh_resolution_hint>
+          <!-- Softer material -->
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Head: a smaller box at the front of the body -->
+      <visual name="head_visual">
+        <pose>0.09 0 0.06 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.035 0.035 0.035</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.6 0.4 0.2 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="head_collision">
+        <pose>0.09 0 0.06 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.035 0.035 0.035</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Ears: two small boxes on top of the head -->
+      <visual name="left_ear_visual">
+        <pose>0.09 0.015 0.08 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.005 0.015</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="left_ear_collision">
+        <pose>0.09 0.015 0.08 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.005 0.015</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="right_ear_visual">
+        <pose>0.09 -0.015 0.08 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.005 0.015</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="right_ear_collision">
+        <pose>0.09 -0.015 0.08 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.005 0.015</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Legs: four small boxes underneath the body -->
+      <!-- Place them at corners of the body, slightly lower -->
+      <visual name="front_left_leg_visual">
+        <pose>0.05 0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="front_left_leg_collision">
+        <pose>0.05 0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="front_right_leg_visual">
+        <pose>0.05 -0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.00</diffuse>
+        </material>
+      </visual>
+      <collision name="front_right_leg_collision">
+        <pose>0.05 -0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="rear_left_leg_visual">
+        <pose>-0.05 0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="rear_left_leg_collision">
+        <pose>-0.05 0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <visual name="rear_right_leg_visual">
+        <pose>-0.05 -0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="rear_right_leg_collision">
+        <pose>-0.05 -0.02 0.025 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.015 0.015 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+      <!-- Tail: a small box at the back of the body, slightly elevated -->
+      <visual name="tail_visual">
+        <pose>-0.075 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.025</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>0.0 0.0 0.0 1.0</diffuse>
+        </material>
+      </visual>
+      <collision name="tail_collision">
+        <pose>-0.075 0 0.075 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.01 0.025</size>
+          </box>
+        </geometry>
+        <drake:proximity_properties>
+          <drake:compliant_hydroelastic/>
+          <drake:hydroelastic_modulus>5.0e4</drake:hydroelastic_modulus>
+        </drake:proximity_properties>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
+"""
+with open(soft_dog_sdf_path, "w") as f:
+    f.write(soft_dog_sdf)
+
+#create a hard rubiks cube
+rubiks_cube_sdf_path="rubiks_cube.sdf"
+rubiks_cube_sdf="""<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="rubiks_cube">
+    <link name="rubiks_cube_link">
+      <inertial>
+        <mass>0.1</mass>
+        <!-- Approximate center of mass and inertia -->
+        <pose>0 0 0 0 0 0</pose>
+        <inertia>
+          <ixx>0.01</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.01</iyy>
+          <iyz>0</iyz>
+          <izz>0.01</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Each small cube: size 0.02 x 0.02 x 0.02 -->
+      <!-- Indices i,j,k = -1,0,1 -->
+      <!-- Position: x = i*0.02, y = j*0.02, z = k*0.02 -->
+
+      <!-- We'll define a function here in pseudocode:
+           color(i,j,k):
+             if k=1:   white (1 1 1 1)
+             else if k=-1: yellow (1 1 0 1)
+             else if j=1: red (1 0 0 1)
+             else if j=-1: orange (1 0.5 0 1)
+             else if i=-1: blue (0 0 1 1)
+             else if i=1:  green (0 1 0 1)
+             else: black (0 0 0 1)
+      -->
+
+      <!-- We'll just write out the 27 cubes using this logic -->
+
+      <!-- Define a helper to choose color -->
+      <!-- We'll do it inline for each cube -->
+
+      <!-- Loop over i,j,k in {-1,0,1} -->
+      <!-- i: x-coord, j:y-coord, k:z-coord -->
+
+      <!-- We'll create a small function to pick color as comments and then write the code: -->
+      <!-- color priority:
+           k=1: white (1 1 1 1)
+           k=-1: yellow (1 1 0 1)
+           j=1: red (1 0 0 1)
+           j=-1: orange (1 0.5 0 1)
+           i=-1: blue (0 0 1 1)
+           i=1: green (0 1 0 1)
+           else: black (0 0 0 1)
+      -->
+
+      <!-- We will just systematically do this in code-like manner: -->
+      <!-- There are 27 cubes: i,j,k ∈ {-1,0,1} -->
+
+      <!-- We'll write a small snippet to save space: -->
+      <!-- For each (i,j,k), determine color and write visual+collision -->
+
+      <!-- Let's do a nested structure for clarity -->
+
+      <!-- k = 1 row (top layer, all white) -->
+      <!-- j = -1,0,1; i = -1,0,1 -->
+      <!-- top layer: k=1 => white -->
+      <!-- White: (1 1 1 1) -->
+      <!-- We'll produce 9 cubes for k=1 -->
+      <!-- We'll just write them out explicitly: -->
+
+      <!-- k=1, j=-1, i=-1 -->
+      <visual name="cube_i-1_j-1_k1_visual">
+        <pose>-0.02 -0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j-1_k1_collision">
+        <pose>-0.02 -0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=-1, i=0 -->
+      <visual name="cube_i0_j-1_k1_visual">
+        <pose>0 -0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j-1_k1_collision">
+        <pose>0 -0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=-1, i=1 -->
+      <visual name="cube_i1_j-1_k1_visual">
+        <pose>0.02 -0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j-1_k1_collision">
+        <pose>0.02 -0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=0, i=-1 -->
+      <visual name="cube_i-1_j0_k1_visual">
+        <pose>-0.02 0 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j0_k1_collision">
+        <pose>-0.02 0 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=0, i=0 -->
+      <visual name="cube_i0_j0_k1_visual">
+        <pose>0 0 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j0_k1_collision">
+        <pose>0 0 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=0, i=1 -->
+      <visual name="cube_i1_j0_k1_visual">
+        <pose>0.02 0 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j0_k1_collision">
+        <pose>0.02 0 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=1, i=-1 -->
+      <visual name="cube_i-1_j1_k1_visual">
+        <pose>-0.02 0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j1_k1_collision">
+        <pose>-0.02 0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=1, i=0 -->
+      <visual name="cube_i0_j1_k1_visual">
+        <pose>0 0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j1_k1_collision">
+        <pose>0 0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=1, j=1, i=1 -->
+      <visual name="cube_i1_j1_k1_visual">
+        <pose>0.02 0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j1_k1_collision">
+        <pose>0.02 0.02 0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- Similarly fill out the middle layer (k=0) and bottom layer (k=-1) using the color priority rule. -->
+      <!-- For brevity, we'll just pick the colors directly using the same logic: -->
+
+      <!-- Middle layer k=0:
+           If j=1: front=red
+           If j=-1: back=orange
+           If i=-1: left=blue
+           If i=1: right=green
+           Else internal=black
+      -->
+
+      <!-- k=0, j=-1, i=-1: (i=-1 => blue) -->
+      <visual name="cube_i-1_j-1_k0_visual">
+        <pose>-0.02 -0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>0 0 1 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j-1_k0_collision">
+        <pose>-0.02 -0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=-1, i=0: (j=-1 => orange) -->
+      <visual name="cube_i0_j-1_k0_visual">
+        <pose>0 -0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0.5 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j-1_k0_collision">
+        <pose>0 -0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=-1, i=1: (j=-1 => orange) -->
+      <visual name="cube_i1_j-1_k0_visual">
+        <pose>0.02 -0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0.5 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j-1_k0_collision">
+        <pose>0.02 -0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=0, i=-1: (i=-1 => blue) -->
+      <visual name="cube_i-1_j0_k0_visual">
+        <pose>-0.02 0 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>0 0 1 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j0_k0_collision">
+        <pose>-0.02 0 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=0, i=0: internal => black -->
+      <visual name="cube_i0_j0_k0_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>0 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j0_k0_collision">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=0, i=1: (i=1 => green) -->
+      <visual name="cube_i1_j0_k0_visual">
+        <pose>0.02 0 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>0 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j0_k0_collision">
+        <pose>0.02 0 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=1, i=-1: (j=1 => red) -->
+      <visual name="cube_i-1_j1_k0_visual">
+        <pose>-0.02 0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j1_k0_collision">
+        <pose>-0.02 0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=1, i=0: (j=1 => red) -->
+      <visual name="cube_i0_j1_k0_visual">
+        <pose>0 0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j1_k0_collision">
+        <pose>0 0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- k=0, j=1, i=1: (j=1 => red) -->
+      <visual name="cube_i1_j1_k0_visual">
+        <pose>0.02 0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 0 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j1_k0_collision">
+        <pose>0.02 0.02 0 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <!-- Bottom layer k=-1 (yellow if top priority?), top priority states k=-1 => yellow -->
+      <!-- This means the bottom layer is all yellow, regardless of i,j. -->
+      <!-- 9 cubes for k=-1, all yellow: (1 1 0 1) -->
+
+      <!-- k=-1 layer -->
+      <!-- We'll just repeat the pattern with all yellow: -->
+      <!-- i,j in {-1,0,1}, z=-0.02 -->
+
+      <visual name="cube_i-1_j-1_k-1_visual">
+        <pose>-0.02 -0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j-1_k-1_collision">
+        <pose>-0.02 -0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i0_j-1_k-1_visual">
+        <pose>0 -0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j-1_k-1_collision">
+        <pose>0 -0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i1_j-1_k-1_visual">
+        <pose>0.02 -0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j-1_k-1_collision">
+        <pose>0.02 -0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i-1_j0_k-1_visual">
+        <pose>-0.02 0 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j0_k-1_collision">
+        <pose>-0.02 0 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i0_j0_k-1_visual">
+        <pose>0 0 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j0_k-1_collision">
+        <pose>0 0 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i1_j0_k-1_visual">
+        <pose>0.02 0 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j0_k-1_collision">
+        <pose>0.02 0 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i-1_j1_k-1_visual">
+        <pose>-0.02 0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i-1_j1_k-1_collision">
+        <pose>-0.02 0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i0_j1_k-1_visual">
+        <pose>0 0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i0_j1_k-1_collision">
+        <pose>0 0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+      <visual name="cube_i1_j1_k-1_visual">
+        <pose>0.02 0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <material><diffuse>1 1 0 1</diffuse></material>
+      </visual>
+      <collision name="cube_i1_j1_k-1_collision">
+        <pose>0.02 0.02 -0.02 0 0 0</pose>
+        <geometry><box><size>0.02 0.02 0.02</size></box></geometry>
+        <drake:proximity_properties><drake:compliant_hydroelastic/><drake:hydroelastic_modulus>1e9</drake:hydroelastic_modulus></drake:proximity_properties>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
+"""
+
+with open(rubiks_cube_sdf_path, "w") as f:
+    f.write(rubiks_cube_sdf)
+
+pkg_xml = """<?xml version="1.0"?>
+<package format="2">
+  <name>dummy_project</name>
+  <version>0.0.0</version>
+  <description>
+    dummy project?
+  </description>
+  <maintainer email="manipulation-student@mit.edu">IIWA</maintainer>
+  <author>IIWA</author>
+  <license>N/A</license>
+</package>
+"""
+
+with open("package.xml", "w") as f:
+    f.write(pkg_xml)
+
+
+class NoDiffIKWarnings(logging.Filter):
+    def filter(self, record):
+        return not record.getMessage().startswith("Differential IK")
+
+
+logging.getLogger("drake").addFilter(NoDiffIKWarnings())
+
+# Start the visualizer.
+meshcat = StartMeshcat()
+
+rng = np.random.default_rng(135)  # this is for python
+generator = RandomGenerator(rng.integers(0, 1000))  # this is for c++
+
+def make_internal_model():
+    builder = DiagramBuilder()
+    plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=0.001)
+    parser = Parser(plant)
+    ConfigureParser(parser)
+    parser.AddModelsFromUrl("package://manipulation/clutter_planning.dmd.yaml")
+    plant.Finalize()
+    return builder.Build()
+
+class GraspSelector(LeafSystem):
+    def __init__(self, plant, bin_instance=None, camera_body_indices=None, crop_lower=None, crop_upper=None):
+        LeafSystem.__init__(self)
+        self._camera_body_indices = camera_body_indices
+        self._num_cameras = len(camera_body_indices)
+        model_point_cloud = AbstractValue.Make(PointCloud(0))
+        for i in range(self._num_cameras):
+            self.DeclareAbstractInputPort(f"cloud{i}_W", model_point_cloud)
+        self.DeclareAbstractInputPort("body_poses", AbstractValue.Make([RigidTransform()]))
+
+        port = self.DeclareAbstractOutputPort(
+            "grasp_selection",
+            lambda: AbstractValue.Make((np.inf, RigidTransform(), 0.0)),
+            self.SelectGrasp,
+        )
+        port.disable_caching_by_default()
+
+        # Compute crop box.
+        if crop_lower is not None and crop_upper is not None:
+            self._crop_lower = crop_lower
+            self._crop_upper = crop_upper
+        else:
+            context = plant.CreateDefaultContext()
+            bin_body = plant.GetBodyByName("bin_base", bin_instance)
+            X_B = plant.EvalBodyPoseInWorld(context, bin_body)
+            margin = 0.001
+            a = X_B.multiply([-0.22 + 0.025 + margin, -0.29 + 0.025 + margin, 0.015 + margin])
+            b = X_B.multiply([0.22 - 0.1 - margin, 0.29 - 0.025 - margin, 2.0])
+            self._crop_lower = np.minimum(a, b)
+            self._crop_upper = np.maximum(a, b)
+
+        self._internal_model = make_internal_model()
+        self._internal_model_context = self._internal_model.CreateDefaultContext()
+        self._rng = np.random.default_rng()
+        self._camera_body_indices = camera_body_indices
+
+    def SelectGrasp(self, context, output):
+        body_poses = self.get_input_port(self._num_cameras).Eval(context)
+        pcd = []
+        for i in range(self._num_cameras):
+            cloud = self.get_input_port(i).Eval(context)
+            cropped_cloud = cloud.Crop(self._crop_lower, self._crop_upper)
+            cropped_cloud.EstimateNormals(radius=0.1, num_closest=30)
+            X_WC = body_poses[self._camera_body_indices[i]]
+            cropped_cloud.FlipNormalsTowardPoint(X_WC.translation())
+            pcd.append(cropped_cloud)
+        merged_pcd = Concatenate(pcd)
+        down_sampled_pcd = merged_pcd.VoxelizedDownSample(voxel_size=0.005)
+
+        costs = []
+        X_Gs = []
+        for i in range(100 if running_as_notebook else 2):
+            cost, X_G = GenerateAntipodalGraspCandidate(
+                self._internal_model,
+                self._internal_model_context,
+                down_sampled_pcd,
+                self._rng,
+            )
+            if np.isfinite(cost):
+                costs.append(cost)
+                X_Gs.append(X_G)
+
+        if len(costs) == 0:
+            X_WG = RigidTransform(RollPitchYaw(-np.pi / 2, 0, np.pi / 2), [0.5, 0, 0.22])
+            output.set_value((np.inf, X_WG, 0.0))
+        else:
+            best = np.argmin(costs)
+            X_G_best = X_Gs[best]
+            pcd_in_gripper_frame = deepcopy(down_sampled_pcd)
+            xyzs = pcd_in_gripper_frame.mutable_xyzs()
+            X_G_inv = X_G_best.inverse()
+            xyzs[...] = X_G_inv.multiply(xyzs)
+
+            points_in_gripper = pcd_in_gripper_frame.xyzs()
+            x_positions = points_in_gripper[0, :]
+
+            if x_positions.size == 0:
+                intended_grasp_width = 0.01
+            else:
+                x_min = np.min(x_positions)
+                x_max = np.max(x_positions)
+                intended_grasp_width = x_max - x_min
+                if intended_grasp_width <= 0:
+                    intended_grasp_width = 0.01
+
+            output.set_value((costs[best], X_G_best, intended_grasp_width))
+
+class PlannerState(Enum):
+    WAIT_FOR_OBJECTS_TO_SETTLE = 1
+    PICKING_AND_PLACING = 2
+    GO_HOME = 3
+
+class Planner(LeafSystem):
+    def __init__(self, plant):
+        LeafSystem.__init__(self)
+        self._gripper_body_index = plant.GetBodyByName("body").index()
+        self.DeclareAbstractInputPort(
+            "body_poses", AbstractValue.Make([RigidTransform()])
+        )
+        self._picking_grasp_index = self.DeclareAbstractInputPort(
+            "picking_grasp", AbstractValue.Make((np.inf, RigidTransform(), 0.0))
+        ).get_index()
+        self._wsg_state_index = self.DeclareVectorInputPort("wsg_state", 2).get_index()
+
+        self._mode_index = self.DeclareAbstractState(AbstractValue.Make(PlannerState.WAIT_FOR_OBJECTS_TO_SETTLE))
+        self._traj_X_G_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePose()))
+        self._traj_wsg_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePolynomial()))
+        self._times_index = self.DeclareAbstractState(AbstractValue.Make({"initial": 0.0}))
+        self._attempts_index = self.DeclareDiscreteState(1)
+        self._object_classified_index = self.DeclareAbstractState(AbstractValue.Make(False))
+        self._intended_grasp_width_index = self.DeclareAbstractState(AbstractValue.Make(0.0))
+        self._classification_result_index = self.DeclareAbstractState(AbstractValue.Make(None))
+        self._postpick_pose_index = self.DeclareAbstractState(AbstractValue.Make(RigidTransform()))
+
+        # We'll store full trajectories for both "hard" and "soft" place
+        self._traj_X_G_hard_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePose()))
+        self._traj_wsg_hard_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePolynomial()))
+        self._traj_X_G_soft_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePose()))
+        self._traj_wsg_soft_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePolynomial()))
+
+        self.DeclareAbstractOutputPort(
+            "X_WG",
+            lambda: AbstractValue.Make(RigidTransform()),
+            self.CalcGripperPose,
+        )
+        self.DeclareVectorOutputPort("wsg_position", 1, self.CalcWsgPosition)
+
+        num_positions = 7
+        self._iiwa_position_index = self.DeclareVectorInputPort("iiwa_position", num_positions).get_index()
+        self.DeclareAbstractOutputPort(
+            "control_mode",
+            lambda: AbstractValue.Make(InputPortIndex(0)),
+            self.CalcControlMode,
+        )
+        self.DeclareAbstractOutputPort(
+            "reset_diff_ik",
+            lambda: AbstractValue.Make(False),
+            self.CalcDiffIKReset,
+        )
+        self._q0_index = self.DeclareDiscreteState(num_positions)
+        self._traj_q_index = self.DeclareAbstractState(AbstractValue.Make(PiecewisePolynomial()))
+        self.DeclareVectorOutputPort("iiwa_position_command", num_positions, self.CalcIiwaPosition)
+        self.DeclareInitializationDiscreteUpdateEvent(self.Initialize)
+
+        self.DeclarePeriodicUnrestrictedUpdateEvent(0.1, 0.0, self.Update)
+
+    def Update(self, context, state):
+        mode = copy(state.get_mutable_abstract_state(int(self._mode_index)).get_value())
+        current_time = context.get_time()
+        times = context.get_abstract_state(int(self._times_index)).get_value()
+        object_classified = context.get_abstract_state(int(self._object_classified_index)).get_value()
+
+        if mode == PlannerState.WAIT_FOR_OBJECTS_TO_SETTLE:
+            if current_time - times["initial"] > 1.0:
+                # Single planning step: plan everything (pick + both place options)
+                state.get_mutable_abstract_state(int(self._mode_index)).set_value(PlannerState.PICKING_AND_PLACING)
+                self.Plan(context, state)
+            return
+        elif mode == PlannerState.GO_HOME:
+            traj_q = context.get_abstract_state(int(self._traj_q_index)).get_value()
+            if not traj_q.is_time_in_range(current_time):
+                # After going home, wait again
+                state.get_mutable_abstract_state(int(self._mode_index)).set_value(PlannerState.WAIT_FOR_OBJECTS_TO_SETTLE)
+                times = {"initial": current_time}
+                state.get_mutable_abstract_state(int(self._times_index)).set_value(times)
+                # Reset classification flags here for next cycle.
+                state.get_mutable_abstract_state(int(self._object_classified_index)).set_value(False)
+                state.get_mutable_abstract_state(int(self._classification_result_index)).set_value(None)
+            return
+
+        wsg_state = self.get_input_port(self._wsg_state_index).Eval(context)
+        traj_X_G = context.get_abstract_state(int(self._traj_X_G_index)).get_value()
+
+        # If we've reached the end of the currently running trajectory, reset
+        if not traj_X_G.is_time_in_range(current_time):
+            state.get_mutable_abstract_state(int(self._mode_index)).set_value(PlannerState.WAIT_FOR_OBJECTS_TO_SETTLE)
+            times = {"initial": current_time}
+            state.get_mutable_abstract_state(int(self._times_index)).set_value(times)
+            # Reset classification
+            state.get_mutable_abstract_state(int(self._object_classified_index)).set_value(False)
+            state.get_mutable_abstract_state(int(self._classification_result_index)).set_value(None)
+            return
+
+        X_G_current = self.get_input_port(0).Eval(context)[int(self._gripper_body_index)]
+        if np.linalg.norm(traj_X_G.GetPose(current_time).translation() - X_G_current.translation()) > 0.2:
+            # Large deviation, go home
+            self.GoHome(context, state)
+            return
+
+        # Classification logic
+        if not object_classified and "postpick" in times and current_time > times["postpick"]:
+            actual_separation = wsg_state[0]
+            intended_grasp_width = context.get_abstract_state(int(self._intended_grasp_width_index)).get_value()
+            if intended_grasp_width == 0:
+                classification = 'unknown'
+            else:
+                ratio = actual_separation / intended_grasp_width
+                threshold = 0.8
+                if ratio >= threshold:
+                    print(f"The object is hard. Ratio: {ratio:.2f}")
+                    classification = 'hard'
+                else:
+                    print(f"The object is soft. Ratio: {ratio:.2f}")
+                    classification = 'soft'
+
+            state.get_mutable_abstract_state(int(self._object_classified_index)).set_value(True)
+            state.get_mutable_abstract_state(int(self._classification_result_index)).set_value(classification)
+
+            # Now switch to the precomputed correct trajectory.
+            if classification == 'hard':
+                # Switch to hard trajectory
+                hard_traj_X_G = context.get_abstract_state(int(self._traj_X_G_hard_index)).get_value()
+                hard_traj_wsg = context.get_abstract_state(int(self._traj_wsg_hard_index)).get_value()
+                state.get_mutable_abstract_state(int(self._traj_X_G_index)).set_value(hard_traj_X_G)
+                state.get_mutable_abstract_state(int(self._traj_wsg_index)).set_value(hard_traj_wsg)
+            else:
+                soft_traj_X_G = context.get_abstract_state(int(self._traj_X_G_soft_index)).get_value()
+                soft_traj_wsg = context.get_abstract_state(int(self._traj_wsg_soft_index)).get_value()
+                state.get_mutable_abstract_state(int(self._traj_X_G_index)).set_value(soft_traj_X_G)
+                state.get_mutable_abstract_state(int(self._traj_wsg_index)).set_value(soft_traj_wsg)
+
+    def GoHome(self, context, state):
+        print("Replanning due to large tracking error.")
+        state.get_mutable_abstract_state(int(self._mode_index)).set_value(PlannerState.GO_HOME)
+        q = self.get_input_port(int(self._iiwa_position_index)).Eval(context)
+        q0 = copy(context.get_discrete_state(self._q0_index).get_value())
+        q0[0] = q[0]
+
+        current_time = context.get_time()
+        q_traj = PiecewisePolynomial.FirstOrderHold(
+            [current_time, current_time + 5.0], np.vstack((q, q0)).T
+        )
+        state.get_mutable_abstract_state(int(self._traj_q_index)).set_value(q_traj)
+
+    def Plan(self, context, state):
+        # Single planning operation for pick + both place options.
+        cost, X_G_pick, intended_grasp_width = self.get_input_port(self._picking_grasp_index).Eval(context)
+        assert not np.isinf(cost), "Could not find a valid grasp"
+        state.get_mutable_abstract_state(int(self._intended_grasp_width_index)).set_value(intended_grasp_width)
+
+        X_G_initial = self.get_input_port(0).Eval(context)[int(self._gripper_body_index)]
+
+        # Always pick the object first
+        # Common pick frames
+        X_G_common = {
+            "initial": X_G_initial,
+            "prepick": X_G_pick.multiply(RigidTransform([0, 0, 0.1])),
+            "pick": X_G_pick,
+            "postpick": X_G_pick.multiply(RigidTransform([0, 0, 0.1])),
+        }
+
+        # Hard place and soft place frames remain the same:
+        X_G_hard_place = RigidTransform(
+            RollPitchYaw(-np.pi / 2, 0, np.pi / 2),
+            [0.5, 0.0, 0.4]
+        )
+        X_G_soft_place = RigidTransform(
+            RollPitchYaw(-np.pi / 2, 0, np.pi / 2),
+            [0.0, -0.5, 0.4],
+        )
+
+        # Hard trajectory frames:
+        X_G_hard = dict(X_G_common)
+        X_G_hard["preplace"] = X_G_hard_place.multiply(RigidTransform([0, 0, 0.1]))
+        X_G_hard["place"] = X_G_hard_place
+        X_G_hard["postplace"] = X_G_hard_place.multiply(RigidTransform([0, 0, 0.1]))
+
+        # Soft trajectory frames:
+        X_G_soft = dict(X_G_common)
+        X_G_soft["preplace"] = X_G_soft_place.multiply(RigidTransform([0, 0, 0.1]))
+        X_G_soft["place"] = X_G_soft_place
+        X_G_soft["postplace"] = X_G_soft_place.multiply(RigidTransform([0, 0, 0.1]))
+
+        t0 = context.get_time()
+        X_G_common_full = dict(X_G_common)
+        X_G_common_full["place"] = X_G_common["postpick"]  # dummy
+        X_G_common_full, times_common = MakeGripperFrames(X_G_common_full, t0=t0)
+
+        X_G_hard_frames, times_hard = MakeGripperFrames(X_G_hard, t0=t0)
+        X_G_soft_frames, times_soft = MakeGripperFrames(X_G_soft, t0=t0)
+
+        traj_X_G_hard = MakeGripperPoseTrajectory(X_G_hard_frames, times_hard)
+        traj_wsg_hard = MakeGripperCommandTrajectory(times_hard)
+
+        traj_X_G_soft = MakeGripperPoseTrajectory(X_G_soft_frames, times_soft)
+        traj_wsg_soft = MakeGripperCommandTrajectory(times_soft)
+
+        state.get_mutable_abstract_state(int(self._traj_X_G_index)).set_value(traj_X_G_soft)
+        state.get_mutable_abstract_state(int(self._traj_wsg_index)).set_value(traj_wsg_soft)
+        state.get_mutable_abstract_state(int(self._traj_X_G_hard_index)).set_value(traj_X_G_hard)
+        state.get_mutable_abstract_state(int(self._traj_wsg_hard_index)).set_value(traj_wsg_hard)
+        state.get_mutable_abstract_state(int(self._traj_X_G_soft_index)).set_value(traj_X_G_soft)
+        state.get_mutable_abstract_state(int(self._traj_wsg_soft_index)).set_value(traj_wsg_soft)
+
+        state.get_mutable_abstract_state(int(self._times_index)).set_value(times_soft)
+        print(f"Planned full pick-and-place (both hard and soft) trajectories at time {t0}.")
+
+    def CalcGripperPose(self, context, output):
+        traj_X_G = context.get_abstract_state(int(self._traj_X_G_index)).get_value()
+        if traj_X_G.get_number_of_segments() > 0 and traj_X_G.is_time_in_range(context.get_time()):
+            output.set_value(traj_X_G.GetPose(context.get_time()))
+            return
+        output.set_value(self.get_input_port(0).Eval(context)[int(self._gripper_body_index)])
+
+    def CalcWsgPosition(self, context, output):
+        mode = context.get_abstract_state(int(self._mode_index)).get_value()
+        opened = np.array([0.107])
+
+        if mode == PlannerState.GO_HOME:
+            output.SetFromVector([opened])
+            return
+
+        traj_wsg = context.get_abstract_state(int(self._traj_wsg_index)).get_value()
+        if traj_wsg.get_number_of_segments() > 0 and traj_wsg.is_time_in_range(context.get_time()):
+            output.SetFromVector(traj_wsg.value(context.get_time()))
+            return
+
+        output.SetFromVector([opened])
+
+    def CalcControlMode(self, context, output):
+        mode = context.get_abstract_state(int(self._mode_index)).get_value()
+        if mode == PlannerState.GO_HOME:
+            output.set_value(InputPortIndex(2))  # position control home
+        else:
+            output.set_value(InputPortIndex(1))  # diff IK
+
+    def CalcDiffIKReset(self, context, output):
+        mode = context.get_abstract_state(int(self._mode_index)).get_value()
+        if mode == PlannerState.GO_HOME:
+            output.set_value(True)
+        else:
+            output.set_value(False)
+
+    def Initialize(self, context, discrete_state):
+        discrete_state.set_value(
+            int(self._q0_index),
+            self.get_input_port(int(self._iiwa_position_index)).Eval(context),
+        )
+
+    def CalcIiwaPosition(self, context, output):
+        traj_q = context.get_mutable_abstract_state(int(self._traj_q_index)).get_value()
+        output.SetFromVector(traj_q.value(context.get_time()))
+
+
+def clutter_clearing_demo():
+    meshcat.Delete()
+    builder = DiagramBuilder()
+
+    scenario = LoadScenario(
+        filename=FindResource("models/clutter.scenarios.yaml"),
+        scenario_name="Clutter",
+    )
+
+    model_directives = f"""
+directives:
+- add_model:
+    name: object_1
+    file: package://dummy_project/soft_teddy_bear.sdf
+    default_free_body_pose:
+        soft_teddy_bear_link:
+            translation: [-0.7, 0.0, 0.8]
+            rotation: !Rpy {{ deg: [0, 0, 0] }}
+
+- add_model:
+    name: object_2
+    file: package://dummy_project/hard_block.sdf
+    default_free_body_pose:
+        hard_block_link:
+            translation: [-0.5, 0.0, 0.8]
+            rotation: !Rpy {{ deg: [0, 0, 0] }}
+
+- add_model:
+    name: table
+    file: package://dummy_project/table.sdf
+    default_free_body_pose:
+        table_link:
+            translation: [0, 0, 0]
+            rotation: !Rpy {{ deg: [0, 0, 0] }}
+
+- add_frame:
+    name: camera6_origin
+    X_PF:
+        base_frame: world
+        rotation: !Rpy {{ deg: [-140., 0, -150.0]}}
+        translation: [-0.8, 0.4, .45]
+
+- add_model:
+    name: camera6
+    file: package://manipulation/camera_box.sdf
+
+- add_weld:
+    parent: camera6_origin
+    child: camera6::base
+
+- add_frame:
+    name: camera7_origin
+    X_PF:
+        base_frame: world
+        rotation: !Rpy {{ deg: [-140., 0, -30.0]}}
+        translation: [-0.7, -0.4, .45]
+
+- add_model:
+    name: camera7
+    file: package://manipulation/camera_box.sdf
+
+- add_weld:
+    parent: camera7_origin
+    child: camera7::base
+
+- add_frame:
+    name: camera8_origin
+    X_PF:
+        base_frame: world
+        rotation: !Rpy {{ deg: [-140., 0, -90.0]}}
+        translation: [-1.0, 0.0, .45]
+
+- add_model:
+    name: camera8
+    file: package://manipulation/camera_box.sdf
+
+- add_weld:
+    parent: camera8_origin
+    child: camera8::base
+
+- add_frame:
+    name: camera9_origin
+    X_PF:
+        base_frame: world
+        rotation: !Rpy {{ deg: [-140., 0, 150.0]}}
+        translation: [-0.42, 0.38, .45]
+
+- add_model:
+    name: camera9
+    file: package://manipulation/camera_box.sdf
+
+- add_weld:
+    parent: camera9_origin
+    child: camera9::base
+"""
+    scenario = AppendDirectives(scenario, data=model_directives)
+
+    focal = scenario.cameras['camera0'].focal
+    identity = scenario.cameras['camera0'].X_PB.rotation.value
+    background = scenario.cameras['camera0'].background
+
+    for i in range(6,num_cameras):
+        globals()[f'camera{i}_config'] = CameraConfig(
+            width=640,
+            height=480,
+            focal=focal,
+            center_x=None,
+            center_y=None,
+            clipping_near=0.01,
+            clipping_far=500.0,
+            z_near=0.1,
+            z_far=5.0,
+            X_PB=Transform(
+                base_frame=f'camera{i}::base',
+                translation=np.array([0., 0., 0.]),
+                rotation=Rotation(value=identity)
+            ),
+            X_BC=Transform(
+                base_frame=None,
+                translation=np.array([0., 0., 0.]),
+                rotation=Rotation(value=identity)
+            ),
+            X_BD=Transform(
+                base_frame=None,
+                translation=np.array([0., 0., 0.]),
+                rotation=Rotation(value=identity)
+            ),
+            renderer_name='default',
+            renderer_class='',
+            background=background,
+            name=f'camera{i}',
+            fps=10.0,
+            capture_offset=0.0,
+            output_delay=0.0,
+            rgb=True,
+            depth=True,
+            label=False,
+            show_rgb=False,
+            do_compress=True,
+            lcm_bus='default'
+        )
+
+    for i in range(6,num_cameras):
+        scenario.cameras[f"camera{i}"] = globals()[f'camera{i}_config']
+
+    builder = DiagramBuilder()
+    station = builder.AddSystem(
+        MakeHardwareStation(
+            scenario, meshcat, package_xmls=[os.getcwd() + "/package.xml"]
+        )
+    )
+
+    plant = station.GetSubsystemByName("plant")
+
+    to_point_cloud = AddPointClouds(
+        scenario=scenario, station=station, builder=builder
+    )
+
+    picking_grasp_selector = builder.AddSystem(
+        GraspSelector(
+            plant,
+            camera_body_indices=[
+                plant.GetBodyIndices(plant.GetModelInstanceByName(f"camera{i}"))[0] for i in range(num_cameras)
+            ],
+            crop_lower=np.array([-0.9, -0.2, 0.0]),
+            crop_upper=np.array([-0.4, 0.2, 1.0]),
+        )
+    )
+
+    for i in range(num_cameras):
+        builder.Connect(
+            to_point_cloud[f"camera{i}"].get_output_port(),
+            picking_grasp_selector.get_input_port(i),
+        )
+    builder.Connect(
+        station.GetOutputPort("body_poses"),
+        picking_grasp_selector.GetInputPort("body_poses"),
+    )
+
+    planner = builder.AddSystem(Planner(plant))
+    builder.Connect(
+        station.GetOutputPort("body_poses"), planner.GetInputPort("body_poses")
+    )
+    builder.Connect(
+        picking_grasp_selector.get_output_port(),
+        planner.GetInputPort("picking_grasp"),
+    )
+    builder.Connect(
+        station.GetOutputPort("wsg.state_measured"),
+        planner.GetInputPort("wsg_state"),
+    )
+    builder.Connect(
+        station.GetOutputPort("iiwa.position_measured"),
+        planner.GetInputPort("iiwa_position"),
+    )
+
+    robot = station.GetSubsystemByName("iiwa_controller_plant_pointer_system").get()
+
+    diff_ik = AddIiwaDifferentialIK(builder, robot)
+    builder.Connect(planner.GetOutputPort("X_WG"), diff_ik.get_input_port(0))
+    builder.Connect(
+        station.GetOutputPort("iiwa.state_estimated"),
+        diff_ik.GetInputPort("robot_state"),
+    )
+    builder.Connect(
+        planner.GetOutputPort("reset_diff_ik"),
+        diff_ik.GetInputPort("use_robot_state"),
+    )
+
+    builder.Connect(
+        planner.GetOutputPort("wsg_position"),
+        station.GetInputPort("wsg.position"),
+    )
+
+    switch = builder.AddSystem(PortSwitch(7))
+    builder.Connect(diff_ik.get_output_port(), switch.DeclareInputPort("diff_ik"))
+    builder.Connect(
+        planner.GetOutputPort("iiwa_position_command"),
+        switch.DeclareInputPort("position"),
+    )
+    builder.Connect(switch.get_output_port(), station.GetInputPort("iiwa.position"))
+    builder.Connect(
+        planner.GetOutputPort("control_mode"),
+        switch.get_port_selector_input_port(),
+    )
+
+    builder.AddSystem(StopButton(meshcat))
+
+    diagram = builder.Build()
+    simulator = Simulator(diagram)
+    context = simulator.get_context()
+
+    simulator.AdvanceTo(0.1)
+    meshcat.Flush()
+
+    if running_as_notebook:
+        simulator.set_target_realtime_rate(1.0)
+        simulator.AdvanceTo(np.inf)
+
+clutter_clearing_demo()
